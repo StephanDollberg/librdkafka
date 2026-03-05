@@ -76,6 +76,8 @@ static int partition_cnt    = 0;
 static int eof_cnt          = 0;
 static int with_dr          = 1;
 static int read_hdrs        = 0;
+static rd_ts_t warmup       = 0;
+static int warmup_done      = 1;
 
 
 static void stop(int sig) {
@@ -511,6 +513,27 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
         int extra_of = 0;
         *extra       = '\0';
 
+        if (!warmup_done && warmup > 0 && cnt.t_start) {
+                if (now < cnt.t_start + warmup)
+                        return;
+
+                /* Warmup period elapsed: zero the entire struct so that
+                 * subsequent stats and the final summary only reflect
+                 * steady-state performance.  Using memset ensures any
+                 * future fields added to cnt are also covered.
+                 * Adjust msgcnt so the producer loop still terminates
+                 * correctly after cnt.msgs is reset to 0. */
+                if (msgcnt != -1)
+                        msgcnt -= (int)cnt.msgs;
+                memset(&cnt, 0, sizeof(cnt));
+                cnt.t_start = now;
+                cnt.t_last  = now;
+                warmup_done = 1;
+                if (verbosity >= 1)
+                        printf(
+                            "%% Warmup complete, collecting benchmark stats\n");
+        }
+
         if (!(otype & _OTYPE_FORCE) &&
             (((otype & _OTYPE_SUMMARY) && verbosity == 0) ||
              cnt.t_last + dispintvl > now))
@@ -525,6 +548,9 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
         else if (cnt.t_start)
                 t_total = now - cnt.t_start;
         else
+                t_total = 1;
+
+        if (t_total == 0)
                 t_total = 1;
 
         if (latency_mode && cnt.latency_cnt)
@@ -894,7 +920,7 @@ int main(int argc, char **argv) {
 
         while ((opt = getopt(argc, argv,
                              "PCG:t:p:b:s:k:c:fi:MDd:m:S:x:"
-                             "R:a:z:o:X:B:eT:Y:qvIur:lA:OwNH:")) != -1) {
+                             "R:a:z:o:X:B:eT:Y:qvIur:w:lA:OwNH:")) != -1) {
                 switch (opt) {
                 case 'G':
                         if (rd_kafka_conf_set(conf, "group.id", optarg, errstr,
@@ -1098,6 +1124,17 @@ int main(int argc, char **argv) {
                         rate_sleep = (int)(1000000.0 / dtmp);
                         break;
 
+                case 'w':
+                        warmup = (rd_ts_t)atoi(optarg);
+                        if (warmup < 0) {
+                                fprintf(stderr,
+                                        "%% Invalid warmup period: %s\n",
+                                        optarg);
+                                exit(1);
+                        }
+                        warmup *= 1000; /* convert ms to us */
+                        break;
+
                 case 'l':
                         latency_mode = 1;
                         break;
@@ -1178,6 +1215,10 @@ int main(int argc, char **argv) {
                     "  -v           Increase verbosity (default 1)\n"
                     "  -u           Output stats in table format\n"
                     "  -r <rate>    Producer msg/s limit\n"
+                    "  -w <ms>      Warmup period in ms before collecting\n"
+                    "               benchmark stats. During warmup, messages\n"
+                    "               are produced/consumed but counters are\n"
+                    "               reset when the period elapses.\n"
                     "  -l           Latency measurement.\n"
                     "               Needs two matching instances, one\n"
                     "               consumer and one producer, both\n"
@@ -1203,6 +1244,9 @@ int main(int argc, char **argv) {
 
 
         dispintvl *= 1000; /* us */
+
+        if (warmup > 0)
+                warmup_done = 0;
 
         if (verbosity > 1)
                 printf("%% Using random seed %i, verbosity level %i\n", seed,
@@ -1331,6 +1375,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "%% %s\n", errstr);
                 exit(1);
         }
+
+        if (warmup > 0 && verbosity >= 1)
+                printf("%% Warming up for %" PRId64
+                       "ms before collecting benchmark stats\n",
+                       warmup / 1000);
 
         if (mode == 'P') {
                 /*

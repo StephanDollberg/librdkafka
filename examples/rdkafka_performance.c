@@ -76,6 +76,19 @@ static int partition_cnt    = 0;
 static int eof_cnt          = 0;
 static int with_dr          = 1;
 static int read_hdrs        = 0;
+static rd_ts_t warmup       = 0;
+static int warmup_done      = 1;
+
+static struct {
+        rd_ts_t t_start;
+        uint64_t msgs;
+        uint64_t msgs_dr_ok;
+        uint64_t msgs_dr_err;
+        uint64_t bytes_dr_ok;
+        uint64_t bytes;
+        uint64_t tx_err;
+        rd_ts_t t_fetch_latency;
+} baseline;
 
 
 static void stop(int sig) {
@@ -509,7 +522,53 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
         double latency_avg = 0.0f;
         char extra[512];
         int extra_of = 0;
-        *extra       = '\0';
+        rd_ts_t t_start;
+        uint64_t msgs;
+        uint64_t msgs_dr_ok;
+        uint64_t msgs_dr_err;
+        uint64_t bytes_dr_ok;
+        uint64_t bytes;
+        uint64_t tx_err;
+        *extra = '\0';
+
+        if (!warmup_done && warmup > 0 && cnt.t_start &&
+            now >= cnt.t_start + warmup) {
+                baseline.t_start         = now;
+                baseline.msgs            = cnt.msgs;
+                baseline.msgs_dr_ok      = cnt.msgs_dr_ok;
+                baseline.msgs_dr_err     = cnt.msgs_dr_err;
+                baseline.bytes_dr_ok     = cnt.bytes_dr_ok;
+                baseline.bytes           = cnt.bytes;
+                baseline.tx_err          = cnt.tx_err;
+                baseline.t_fetch_latency = cnt.t_fetch_latency;
+                cnt.latency_last         = 0;
+                cnt.latency_lo           = 0;
+                cnt.latency_hi           = 0;
+                cnt.latency_sum          = 0;
+                cnt.latency_cnt          = 0;
+                cnt.msgs_last            = 0;
+                cnt.bytes_last           = 0;
+                warmup_done              = 1;
+                if (verbosity >= 1)
+                        printf(
+                            "%% Warmup complete, collecting benchmark stats\n");
+        }
+
+        if (!warmup_done) {
+                if (otype & _OTYPE_FORCE)
+                        printf(
+                            "%% Warmup period not reached, no benchmark "
+                            "stats collected\n");
+                return;
+        }
+
+        t_start     = baseline.t_start ? baseline.t_start : cnt.t_start;
+        msgs        = cnt.msgs - baseline.msgs;
+        msgs_dr_ok  = cnt.msgs_dr_ok - baseline.msgs_dr_ok;
+        msgs_dr_err = cnt.msgs_dr_err - baseline.msgs_dr_err;
+        bytes_dr_ok = cnt.bytes_dr_ok - baseline.bytes_dr_ok;
+        bytes       = cnt.bytes - baseline.bytes;
+        tx_err      = cnt.tx_err - baseline.tx_err;
 
         if (!(otype & _OTYPE_FORCE) &&
             (((otype & _OTYPE_SUMMARY) && verbosity == 0) ||
@@ -519,12 +578,15 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
         print_header = !rows_written || (verbosity > 0 && !(rows_written % 20));
 
         if (cnt.t_end_send)
-                t_total = cnt.t_end_send - cnt.t_start;
+                t_total = cnt.t_end_send - t_start;
         else if (cnt.t_end)
-                t_total = cnt.t_end - cnt.t_start;
-        else if (cnt.t_start)
-                t_total = now - cnt.t_start;
+                t_total = cnt.t_end - t_start;
+        else if (t_start)
+                t_total = now - t_start;
         else
+                t_total = 1;
+
+        if (t_total == 0)
                 t_total = 1;
 
         if (latency_mode && cnt.latency_cnt)
@@ -571,16 +633,15 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
 
                         ROW_START();
                         COL_PR64("elapsed", t_total / 1000);
-                        COL_PR64("msgs", cnt.msgs);
-                        COL_PR64("bytes", cnt.bytes);
+                        COL_PR64("msgs", msgs);
+                        COL_PR64("bytes", bytes);
                         COL_PR64("rtt", cnt.avg_rtt / 1000);
-                        COL_PR64("dr", cnt.msgs_dr_ok);
-                        COL_PR64("dr_m/s",
-                                 ((cnt.msgs_dr_ok * 1000000) / t_total));
+                        COL_PR64("dr", msgs_dr_ok);
+                        COL_PR64("dr_m/s", ((msgs_dr_ok * 1000000) / t_total));
                         COL_PRF("dr_MB/s",
-                                (float)((cnt.bytes_dr_ok) / (float)t_total));
-                        COL_PR64("dr_err", cnt.msgs_dr_err);
-                        COL_PR64("tx_err", cnt.tx_err);
+                                (float)(bytes_dr_ok / (float)t_total));
+                        COL_PR64("dr_err", msgs_dr_err);
+                        COL_PR64("tx_err", tx_err);
                         COL_PR64("outq",
                                  rk ? (uint64_t)rd_kafka_outq_len(rk) : 0);
                         COL_PR64("offset", (uint64_t)cnt.last_offset);
@@ -608,12 +669,11 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
                                "%" PRIu64
                                " produce failures, %i in queue, "
                                "%s compression\n",
-                               cnt.msgs, cnt.bytes, cnt.msgs_dr_ok,
-                               cnt.last_offset, cnt.msgs_dr_err, t_total / 1000,
-                               ((cnt.msgs_dr_ok * 1000000) / t_total),
-                               (float)((cnt.bytes_dr_ok) / (float)t_total),
-                               cnt.tx_err, rk ? rd_kafka_outq_len(rk) : 0,
-                               compression);
+                               msgs, bytes, msgs_dr_ok, cnt.last_offset,
+                               msgs_dr_err, t_total / 1000,
+                               ((msgs_dr_ok * 1000000) / t_total),
+                               (float)(bytes_dr_ok / (float)t_total), tx_err,
+                               rk ? rd_kafka_outq_len(rk) : 0, compression);
                 }
 
         } else {
@@ -641,12 +701,12 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
 
                         ROW_START();
                         COL_PR64("elapsed", t_total / 1000);
-                        COL_PR64("msgs", cnt.msgs);
-                        COL_PR64("bytes", cnt.bytes);
+                        COL_PR64("msgs", msgs);
+                        COL_PR64("bytes", bytes);
                         COL_PR64("rtt", cnt.avg_rtt / 1000);
-                        COL_PR64("m/s", ((cnt.msgs * 1000000) / t_total));
-                        COL_PRF("MB/s", (float)((cnt.bytes) / (float)t_total));
-                        COL_PR64("rx_err", cnt.msgs_dr_err);
+                        COL_PR64("m/s", ((msgs * 1000000) / t_total));
+                        COL_PRF("MB/s", (float)(bytes / (float)t_total));
+                        COL_PR64("rx_err", msgs_dr_err);
                         COL_PR64("offset", cnt.offset);
                         if (latency_mode) {
                                 COL_PRF("lat_curr", cnt.latency_last / 1000.0f);
@@ -674,14 +734,14 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
                                " msgs/s "
                                "(%.02f MB/s)"
                                "%s\n",
-                               cnt.msgs, cnt.bytes, t_total / 1000,
-                               ((cnt.msgs * 1000000) / t_total),
-                               (float)((cnt.bytes) / (float)t_total), extra);
+                               msgs, bytes, t_total / 1000,
+                               ((msgs * 1000000) / t_total),
+                               (float)(bytes / (float)t_total), extra);
                 }
 
                 if (incremental_mode && now > cnt.t_last) {
-                        uint64_t i_msgs  = cnt.msgs - cnt.msgs_last;
-                        uint64_t i_bytes = cnt.bytes - cnt.bytes_last;
+                        uint64_t i_msgs  = msgs - cnt.msgs_last;
+                        uint64_t i_bytes = bytes - cnt.bytes_last;
                         uint64_t i_time  = cnt.t_last ? now - cnt.t_last : 0;
 
                         printf("%% INTERVAL: %" PRIu64
@@ -699,8 +759,8 @@ print_stats(rd_kafka_t *rk, int mode, int otype, const char *compression) {
         }
 
         cnt.t_last     = now;
-        cnt.msgs_last  = cnt.msgs;
-        cnt.bytes_last = cnt.bytes;
+        cnt.msgs_last  = msgs;
+        cnt.bytes_last = bytes;
 }
 
 
@@ -894,7 +954,7 @@ int main(int argc, char **argv) {
 
         while ((opt = getopt(argc, argv,
                              "PCG:t:p:b:s:k:c:fi:MDd:m:S:x:"
-                             "R:a:z:o:X:B:eT:Y:qvIur:lA:OwNH:")) != -1) {
+                             "R:a:z:o:X:B:eT:Y:qvIur:w:lA:OwNH:")) != -1) {
                 switch (opt) {
                 case 'G':
                         if (rd_kafka_conf_set(conf, "group.id", optarg, errstr,
@@ -1098,6 +1158,17 @@ int main(int argc, char **argv) {
                         rate_sleep = (int)(1000000.0 / dtmp);
                         break;
 
+                case 'w':
+                        warmup = (rd_ts_t)atoi(optarg);
+                        if (warmup < 0) {
+                                fprintf(stderr,
+                                        "%% Invalid warmup period: %s\n",
+                                        optarg);
+                                exit(1);
+                        }
+                        warmup *= 1000;
+                        break;
+
                 case 'l':
                         latency_mode = 1;
                         break;
@@ -1178,6 +1249,7 @@ int main(int argc, char **argv) {
                     "  -v           Increase verbosity (default 1)\n"
                     "  -u           Output stats in table format\n"
                     "  -r <rate>    Producer msg/s limit\n"
+                    "  -w <ms>      Warmup period before collecting stats\n"
                     "  -l           Latency measurement.\n"
                     "               Needs two matching instances, one\n"
                     "               consumer and one producer, both\n"
@@ -1203,6 +1275,9 @@ int main(int argc, char **argv) {
 
 
         dispintvl *= 1000; /* us */
+
+        if (warmup > 0)
+                warmup_done = 0;
 
         if (verbosity > 1)
                 printf("%% Using random seed %i, verbosity level %i\n", seed,
@@ -1403,6 +1478,11 @@ int main(int argc, char **argv) {
                         dr_disp_div = 10;
 
                 cnt.t_start = cnt.t_last = rd_clock();
+
+                if (warmup > 0)
+                        printf("%% Warming up for %" PRId64
+                               "ms before collecting benchmark stats\n",
+                               warmup / 1000);
 
                 msgs_wait_produce_cnt = msgcnt;
 
@@ -1755,9 +1835,11 @@ int main(int argc, char **argv) {
 
         print_stats(NULL, mode, otype | _OTYPE_FORCE, compression);
 
-        if (cnt.t_fetch_latency && cnt.msgs)
+        if ((cnt.t_fetch_latency - baseline.t_fetch_latency) &&
+            (cnt.msgs - baseline.msgs))
                 printf("%% Average application fetch latency: %" PRIu64 "us\n",
-                       cnt.t_fetch_latency / cnt.msgs);
+                       (cnt.t_fetch_latency - baseline.t_fetch_latency) /
+                           (cnt.msgs - baseline.msgs));
 
         if (latency_fp)
                 fclose(latency_fp);
